@@ -11,8 +11,6 @@ from src.cl_utils import get_dataset_and_classifier_for_split
 from src.merging.task_vectors import TaskVector
 from src.eval import evaluate
 
-
-
 def finetune(args):
     
     train_dataset = args.dataset
@@ -21,35 +19,29 @@ def finetune(args):
                           f"ft-epochs-{args.epochs}-seed:{args.seed}"
                           )
 
-    # finetune for each split separately
+    # 各分割タスクの学習
     for split_idx in range(args.n_splits):
         
         print(f"\n##### SPLIT {split_idx} #####")
         ft_path = os.path.join(ckpdir, f'finetuned_{split_idx}.pt')
-        if os.path.exists(os.path.join(ckpdir, f'finetuned_{split_idx}.pt')):
-            print(f"Skipping finetuning on split {split_idx}, "
-                  f"ckpt already exists under {os.path.join(ckpdir, f'finetuned_{split_idx}.pt')}")
+        if os.path.exists(ft_path):
+            print(f"Skipping finetuning on split {split_idx}, ckpt already exists.")
             continue
 
         assert train_dataset is not None, "Please provide a training dataset."
+        
+        # エンコーダーの読み込み（変更なし）
         if args.load is not None and args.load.endswith('pt'):
             image_encoder = ImageEncoder.load(args.load, keep_lang=True)
         elif args.sequential_finetuning and split_idx != 0:
-            """task_vectors = [ #追加
-                TaskVector(pretrained_checkpoint, f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}/finetuned_{_idx}.pt')
-                for _idx in range(split_idx)
-            ]"""
             prev_ckpt = os.path.join(ckpdir, f'finetuned_{split_idx-1}.pt')
-            #merged_tv = sum(task_vectors) #追加
-
             print(f'Loading image encoder from prev task {prev_ckpt=}')
             image_encoder = torch.load(prev_ckpt)
-            #image_encoder = merged_tv.apply_to(pretrained_checkpoint, scaling_coef=1/split_idx) #追加
         else:
             print('Building image encoder.')
             image_encoder = ImageEncoder(args, keep_lang=True)
 
-        if split_idx==0 and not os.path.exists(f'checkpoints/{args.model}/zeroshot.pt'):
+        if split_idx == 0 and not os.path.exists(f'checkpoints/{args.model}/zeroshot.pt'):
             image_encoder.save(f'checkpoints/{args.model}/zeroshot.pt')
 
         preprocess_fn = image_encoder.train_preprocess
@@ -61,6 +53,8 @@ def finetune(args):
             location=args.data_location,
             batch_size=args.batch_size
         )
+        
+        # 修正版の関数を呼び出し（active_classesが付与されたdatasetが返る）
         dataset, classification_head = get_dataset_and_classifier_for_split(
             dataset, split_idx, image_encoder, args
         )
@@ -88,6 +82,16 @@ def finetune(args):
         if args.save is not None:
             os.makedirs(ckpdir, exist_ok=True)
 
+        # 【重要】 Logit Mask の作成
+        # 現在のタスクに関係ないクラスをマスクするためのテンソルを準備
+        active_classes = dataset.active_classes
+        if active_classes is None or len(active_classes) == 0:
+            # Data incrementalなどの場合は全クラス対象
+            use_mask = False
+        else:
+            use_mask = True
+            print(f"Masking logits for non-active classes. Active: {len(active_classes)} classes.")
+
         for epoch in range(args.epochs):
             model = model.cuda()
             model.train()
@@ -104,14 +108,22 @@ def finetune(args):
                 labels = batch['labels'].to('cuda:0')
                 data_time = time.time() - start_time
 
+                # 順伝播
                 logits = model(inputs)
 
-                loss = loss_fn(logits, labels)
+                # 【変更点】 Logit Masking の適用
+                if use_mask:
+                    # 全てを -inf で初期化
+                    mask = torch.full_like(logits, float('-inf'))
+                    # アクティブなクラスだけ 0 にする（元の値を保持）
+                    mask[:, active_classes] = 0
+                    # マスクを適用（非アクティブクラスは -inf になり、Softmaxで0になる）
+                    logits = logits + mask
 
+                loss = loss_fn(logits, labels)
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
-
                 optimizer.step()
                 batch_time = time.time() - start_time
 
@@ -123,34 +135,35 @@ def finetune(args):
                     )
 
         # Evaluate
+        # 評価時はマスクなし（全クラスでの評価）またはマスクありを選べますが、
+        # 通常のCIL評価では、学習した範囲のクラスのみ、あるいは全クラスで評価します。
+        # ここでは変更せずそのまま評価関数に渡します。
         image_encoder = model.module.image_encoder
         evaluate(image_encoder, args)
 
         if args.save is not None:
+            # エンコーダーの保存
             image_encoder.save(ft_path)
-            # 【追加】 Classification Head (そのタスクのランダム重み) の保存
+            
+            # 【重要】 Classification Head の保存
+            # Task Vector等で使用するために、学習後のフルサイズHeadを保存します
             head_path = os.path.join(ckpdir, f'head_{split_idx}.pt')
-            # classification_head は ImageClassifier の属性としてアクセス可能
-            # modelがDataParallelでラップされている場合を考慮
             if isinstance(model, torch.nn.DataParallel):
                 model.module.classification_head.save(head_path)
             else:
                 model.classification_head.save(head_path)
 
 
-
 if __name__ == '__main__':
     args = parse_arguments()
 
-    #pretrained_checkpoint = f'checkpoints/{args.model}/zeroshot.pt' #追加
-    
     args.lr = 1e-5
-    args.batch_size = 16
+    args.batch_size = 16 # 必要に応じて調整
     sequential_ft_dir = 'sequential_finetuning/' if args.sequential_finetuning else ''
     args.save = f'checkpoints/{args.model}/{sequential_ft_dir}{args.split_strategy}_incremental'
 
     print('='*100)
-    print(f'Finetuning {args.model} on {args.dataset} ({args.n_splits} splits)')
+    print(f'Finetuning {args.model} on {args.dataset} ({args.n_splits} splits) [Full-Head Init]')
     print('='*100)
 
     finetune(args)
