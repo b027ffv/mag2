@@ -9,23 +9,31 @@ from src.datasets.registry import get_dataset
 from src.modeling import ClassificationHead, ImageEncoder
 
 
-def build_classification_head(model, dataset_name, data_location, device, classnames):
-    # クラス名リストの取得
-    if not classnames:
-        # datasetからクラス数を取得する処理が必要
-        # ...
-        dataset = get_dataset(dataset_name, None, location=data_location)
-        classnames = dataset.classnames
+def build_subset_classification_head(model, dataset_name, classes, data_location, device):
+    """
+    タスクに含まれるクラス数分の固定ランダムヘッドを作成します。
+    """
+    num_classes = len(classes)
     
-    num_classes = len(classnames)
-    embed_dim = model.num_features # timmモデルの特徴量次元数 (ViT-Bなら768)
+    # モデルの特徴量次元数を取得
+    if hasattr(model, 'num_features'):
+        embed_dim = model.num_features
+    else:
+        # ImageEncoder経由などでラップされている場合
+        embed_dim = 768  # ViT-B default, あるいは model.model.num_features等で取得
 
-    # ランダムな重みで初期化 (またはゼロ初期化)
-    # MagMaxのClassificationHeadは重み行列を受け取る設計のため、それに合わせる
-    random_weights = torch.randn(num_classes, embed_dim).to(device)
+    print(f'Building SUBSET classification head (Orthogonal Init) for {num_classes} classes.')
     
-    # 正規化はしない方が良い場合が多いですが、MagMaxの構造に合わせるならTrue
-    classification_head = ClassificationHead(normalize=True, weights=random_weights)
+    # 【重要】直交行列で初期化
+    # 単純な randn よりも、各クラスのベクトルが直交（無相関）に近くなり、学習しやすくなります
+    weights = torch.empty(num_classes, embed_dim, device=device)
+    torch.nn.init.orthogonal_(weights)
+    
+    # 重みの正規化（ノルムを1にする）
+    weights = weights / weights.norm(dim=-1, keepdim=True)
+    
+    # ClassificationHeadを作成 (normalize=Trueでコサイン類似度分類)
+    classification_head = ClassificationHead(normalize=True, weights=weights)
 
     return classification_head
 
@@ -54,12 +62,20 @@ def build_subset_classification_head(model, dataset_name, classes, data_location
 
 
 def get_classification_head(args, dataset_name, image_encoder=None, classnames=None):
-    if isinstance(image_encoder, ImageEncoder) and image_encoder.has_lang():
-        print('Using passed model to create classifier!')
-        model = image_encoder.model
-    else:
-        model = ImageEncoder(args, keep_lang=True).model
-
-    classification_head = build_classification_head(model, dataset_name, args.data_location, args.device, classnames)
+    # 推論時などに呼ばれる関数ですが、MagMax(Fixed Head)では
+    # merge_splitted.py で保存されたヘッドをロードして結合するため、
+    # ここでは便宜的にランダムなヘッドを返すか、エラーにならないようにします。
     
-    return classification_head
+    if image_encoder is None:
+        model = ImageEncoder(args)
+    else:
+        model = image_encoder
+    
+    # データセットからクラス数を取得
+    if not classnames:
+        dataset = get_dataset(dataset_name, None, location=args.data_location)
+        classnames = dataset.classnames
+        
+    return build_subset_classification_head(
+        model, dataset_name, list(range(len(classnames))), args.data_location, args.device
+    )

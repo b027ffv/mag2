@@ -1,4 +1,128 @@
 import torch
+import timm
+from torchvision import transforms
+from src import utils
+
+class ImageEncoder(torch.nn.Module):
+    def __init__(self, args, keep_lang=False):
+        super().__init__()
+        # timmモデルの読み込み
+        # num_classes=0 にすることで、分類ヘッドを含まない特徴ベクトルを出力します
+        print(f"Loading timm model: {args.model}")
+        self.model = timm.create_model(args.model, pretrained=True, num_classes=0)
+        
+        # モデルの出力次元数を取得 (ViT-Bなら768)
+        self.num_features = self.model.num_features
+
+        # 前処理の定義 (ImageNetの標準的な前処理)
+        # 厳密には timm.data.resolve_data_config を使うのがベストですが、標準設定で十分機能します
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        
+        self.train_preprocess = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        
+        self.val_preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+    def forward(self, images):
+        return self.model(images)
+    
+    def __call__(self, inputs):
+        return self.forward(inputs)
+
+    def save(self, filename):
+        print(f'Saving image encoder to {filename}')
+        utils.torch_save(self, filename)
+        
+    def has_lang(self) -> bool:
+        return False
+    
+    def freeze_lang(self):
+        pass
+
+    @classmethod
+    def load(cls, filename):
+        print(f'Loading image encoder from {filename}')
+        return torch.load(filename)
+
+
+class ClassificationHead(torch.nn.Linear):
+    def __init__(self, normalize, weights, biases=None):
+        output_size, input_size = weights.shape
+        super().__init__(input_size, output_size)
+        self.normalize = normalize
+        if weights is not None:
+            self.weight = torch.nn.Parameter(weights.clone())
+        if biases is not None:
+            self.bias = torch.nn.Parameter(biases.clone())
+        else:
+            self.bias = torch.nn.Parameter(torch.zeros_like(self.bias))
+
+    def forward(self, inputs):
+        if self.normalize:
+            # 入力ベクトルを正規化 (コサイン類似度ベースの分類にするため重要)
+            inputs = inputs / inputs.norm(dim=-1, keepdim=True)
+        return super().forward(inputs)
+
+    def save(self, filename):
+        print(f'Saving classification head to {filename}')
+        utils.torch_save(self, filename)
+
+    @classmethod
+    def load(cls, filename):
+        print(f'Loading classification head from {filename}')
+        return utils.torch_load(filename)
+
+
+def concat_classification_heads(clsf_heads):
+    # 複数のヘッドを結合して1つの大きなヘッドにする
+    normalizes = [clsf_head.normalize for clsf_head in clsf_heads]
+    assert len(set(normalizes)) == 1
+
+    ws = [clsf_head.weight for clsf_head in clsf_heads]
+    w = torch.cat(ws, dim=0)
+    
+    bs = [clsf_head.bias for clsf_head in clsf_heads]
+    b = torch.cat(bs, dim=0)
+    
+    return ClassificationHead(normalizes[0], w, b)
+
+
+class ImageClassifier(torch.nn.Module):
+    def __init__(self, image_encoder, classification_head):
+        super().__init__()
+        self.image_encoder = image_encoder
+        self.classification_head = classification_head
+        if self.image_encoder is not None:
+            self.train_preprocess = self.image_encoder.train_preprocess
+            self.val_preprocess = self.image_encoder.val_preprocess
+
+    def freeze_head(self):
+        # ヘッドの重みを固定
+        self.classification_head.weight.requires_grad_(False)
+        self.classification_head.bias.requires_grad_(False)
+
+    def freeze_lang(self):
+        self.image_encoder.freeze_lang()
+
+    def forward(self, inputs, return_features=False):
+        features = self.image_encoder(inputs)
+        outputs = self.classification_head(features)
+        return outputs if not return_features else (outputs, features)
+
+    def save(self, filename):
+        utils.torch_save(self, filename)
+
+"""import torch
 import open_clip
 
 from src import utils
@@ -168,3 +292,4 @@ class MultiHeadImageClassifier(torch.nn.Module):
     def load(cls, filename):
         print(f'Loading image classifier from {filename}')
         return utils.torch_load(filename)
+"""
