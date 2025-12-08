@@ -3,51 +3,60 @@ import torch
 import wandb
 import os
 import tqdm
+import copy
 
 from src.merging.task_vectors import TaskVector, merge_max_abs, merge_rnd_mix
 from src.merging.ties import merge_methods, state_dict_to_vector, vector_to_state_dict
-# from src.eval import eval_single_dataset # カスタム関数に置き換えるためコメントアウト
 from src.eval import eval_task_aware, eval_task_agnostic
 from src.args import parse_arguments
-from src.modeling import ImageClassifier, ClassificationHead, concat_classification_heads
+from src.modeling import ImageClassifier, ClassificationHead
 from src.datasets.registry import get_dataset
 from src.datasets.common import get_dataloader, maybe_dictionarize
-from src import utils # utils.get_logitsを使用するため
+from src import utils 
 
 # Config
 args = parse_arguments()
 pretrained_checkpoint = f'checkpoints/{args.model}/zeroshot.pt'
 
-# --- 追加: Headの読み込みと結合 ---
-def load_and_concat_heads(args, suffix=""):
-    heads = []
-    base_dir = f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}{suffix}'
+# --- 【変更】 ヘッドをマージせず、タスクベクトルのリストとしてロードする ---
+def load_head_task_vectors(args, head_init_path, suffix=""):
+    print(f"Loading common init head from {head_init_path}")
+    if not os.path.exists(head_init_path):
+        raise FileNotFoundError(f"Init head not found at {head_init_path}. Run finetune first.")
     
-    print(f"Loading heads from {base_dir}...")
-    for idx in range(args.n_splits):
-        head_path = os.path.join(base_dir, f'head_{idx}.pt')
-        if os.path.exists(head_path):
-            # ClassificationHeadクラスのロードメソッドを使用
-            # src/modeling.pyの実装に依存しますが、通常は torch.load または ClassificationHead.load
-            # ここでは安全のため torch.load して state_dict から復元するか、そのままロードします
-            try:
-                head = ClassificationHead.load(head_path)
-            except:
-                head = torch.load(head_path) # 直接ロードを試みる
-            heads.append(head)
-        else:
-            raise FileNotFoundError(f"Head checkpoint not found: {head_path}. Please check if you saved heads in finetune_splitted.py.")
-            
-    # 全てのHeadを結合 (Class-Incremental設定では必須)
-    full_head = concat_classification_heads(heads)
-    return full_head.to(args.device)
+    # 初期ヘッドのロード (重み差分計算用)
+    head_init = torch.load(head_init_path) # theta_init
+    
+    head_task_vectors = []
+    base_dir = f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}{suffix}'
+    print(f"Loading heads from {base_dir} and creating TaskVectors...")
 
-# --- 追加: ロードしたHeadを使って評価する関数 ---
+    for split_idx in range(args.n_splits):
+        head_path = os.path.join(base_dir, f'head_{split_idx}.pt')
+        
+        if os.path.exists(head_path):
+            try:
+                task_head = ClassificationHead.load(head_path)
+            except:
+                task_head = torch.load(head_path)
+        else:
+            raise FileNotFoundError(f"Head checkpoint not found: {head_path}")
+            
+        # 差分計算 (Delta = theta_task_i - theta_init)
+        # TaskVectorクラスは辞書形式のベクトルを受け取る
+        vector_dict = {
+            'weight': task_head.weight - head_init.weight,
+            'bias': task_head.bias - head_init.bias
+        }
+        # リストに追加
+        head_task_vectors.append(TaskVector(vector=vector_dict))
+
+    return head_task_vectors
+
+# --- 評価関数 (変更なし) ---
 def eval_with_head(image_encoder, classification_head, dataset_name, args):
-    # ロード済みのHeadを使ってモデルを構築
     model = ImageClassifier(image_encoder, classification_head)
     
-    # データセットの準備 (テストセット全体)
     dataset = get_dataset(
         dataset_name,
         model.val_preprocess,
@@ -57,7 +66,6 @@ def eval_with_head(image_encoder, classification_head, dataset_name, args):
     dataloader = get_dataloader(
         dataset, is_train=False, args=args, image_encoder=None)
 
-    # 評価ループ (src/eval.py の do_eval と同等)
     correct, n = 0., 0.
     model.eval()
     model.to(args.device)
@@ -77,39 +85,38 @@ def eval_with_head(image_encoder, classification_head, dataset_name, args):
     return metrics
 
 
-def evaluate_individial_fts(task_vectors, args, task_agnostic=True):
-    # この関数は今回は修正対象外とします（必要であれば同様に修正してください）
-    pass 
-
-def evaluate_merged_fts(task_vectors, args, merging_f, scaling_coef, task_agnostic=True, only_final=False):
-    # この関数は今回は修正対象外とします
-    pass
-
-
-def search_evaluate_merging(task_vectors, full_head, dataset, n_splits, split_strategy, n_coeffs=20):
+# --- 【修正】 マージ探索関数 (Headも同じメソッドでマージする) ---
+def search_evaluate_merging(encoder_task_vectors, head_task_vectors, head_init_path, dataset, n_splits, split_strategy, n_coeffs=20):
     print(f"\nEVAL: {dataset}-{n_splits} ({split_strategy} incremental)")
     
+    # マージ手法のリスト
     funcs_and_coeffs = [
-        # (merge_rnd_mix, np.linspace(0.5, 1.5, num=n_coeffs+1)[1:]),
-        # (merge_max_abs, np.linspace(0.0, 1.0, num=n_coeffs+1)[1:]),
-        # (sum, np.linspace(0.0, 2.0/n_splits, num=n_coeffs+1)[1:]),
-        (merge_rnd_mix, [1.0]),
-        (merge_max_abs, [0.5]),
-        (sum, [1.0/n_splits]),
+        (merge_rnd_mix, [1.0]),     # Random Mix
+        (merge_max_abs, [0.5]),     # Max Abs
+        (sum, [1.0/n_splits]),      # Average (Sum * 1/N)
     ]
 
     for f, coeffs in funcs_and_coeffs:
         print(f"\nMerging with function: {f.__name__}")
-        merged_tv = f(task_vectors)
         
-        # Apply the resulting task vector
+        # 1. Encoderのマージ
+        merged_encoder_tv = f(encoder_task_vectors)
+        
+        # 2. Headのマージ (同じ関数 f を適用！)
+        merged_head_tv = f(head_task_vectors)
+        
         results = {}
         for scaling_coef in coeffs:
             print(f"Scaling coeff: {scaling_coef}")
-            image_encoder = merged_tv.apply_to(pretrained_checkpoint, scaling_coef=scaling_coef)
             
-            # Evaluate with LOADED HEAD
-            _r = eval_with_head(image_encoder, full_head, dataset, args)['top1']
+            # Encoderの適用
+            image_encoder = merged_encoder_tv.apply_to(pretrained_checkpoint, scaling_coef=scaling_coef)
+            
+            # Headの適用 (TaskVector.apply_to はパスを受け取ってロード＆適用してくれる)
+            classification_head = merged_head_tv.apply_to(head_init_path, scaling_coef=scaling_coef)
+            
+            # 評価
+            _r = eval_with_head(image_encoder, classification_head, dataset, args)['top1']
             
             wandb.log({
                 f"merging/{f.__name__}": _r * 100.0,
@@ -119,36 +126,43 @@ def search_evaluate_merging(task_vectors, full_head, dataset, n_splits, split_st
 
         print(f"Results with function {f.__name__}:\n{results}")
         
-    # TIES merging
+    # --- TIES Merging ---
+    print(f"\nMerging with TIES merging...")
+    
     reset_type = 'topk'
     reset_thresh = 20
     resolve = 'mass'
     merge = 'dis-mean'
-    tv_flat_checks = torch.vstack([state_dict_to_vector(tv.vector) for tv in task_vectors])
     
-    print(f"\nMerging with TIES merging: pruning {reset_type}-{reset_thresh}, resolve sign by {resolve}, merge by {merge}")
-    
-    merged_flat_tv = merge_methods(
-        reset_type,
-        tv_flat_checks,
-        reset_thresh=reset_thresh,
-        resolve_method=resolve,
-        merge_func=merge,
+    # 1. EncoderのTIESマージ
+    encoder_flat = torch.vstack([state_dict_to_vector(tv.vector) for tv in encoder_task_vectors])
+    merged_encoder_flat = merge_methods(
+        reset_type, encoder_flat, reset_thresh=reset_thresh, resolve_method=resolve, merge_func=merge
     )
-    merged_tv = vector_to_state_dict(
-        merged_flat_tv, task_vectors[0].vector, remove_keys=[]
+    merged_encoder_vector = vector_to_state_dict(
+        merged_encoder_flat, encoder_task_vectors[0].vector, remove_keys=[]
     )
-    merged_tv = TaskVector(vector=merged_tv)
+    merged_encoder_tv = TaskVector(vector=merged_encoder_vector)
 
-    # Apply the resulting task vector
+    # 2. HeadのTIESマージ (同じ設定で実行)
+    head_flat = torch.vstack([state_dict_to_vector(tv.vector) for tv in head_task_vectors])
+    merged_head_flat = merge_methods(
+        reset_type, head_flat, reset_thresh=reset_thresh, resolve_method=resolve, merge_func=merge
+    )
+    merged_head_vector = vector_to_state_dict(
+        merged_head_flat, head_task_vectors[0].vector, remove_keys=[]
+    )
+    merged_head_tv = TaskVector(vector=merged_head_vector)
+
+    # 適用と評価
     results = {}
-    # for scaling_coef in np.linspace(0.5, 1.5, num=n_coeffs+1)[1:]:
-    for scaling_coef in [0.55]:
+    for scaling_coef in [0.55]: # TIES推奨値
         print(f"Scaling coeff: {scaling_coef}")
-        image_encoder = merged_tv.apply_to(pretrained_checkpoint, scaling_coef=scaling_coef)
         
-        # Evaluate with LOADED HEAD
-        _r = eval_with_head(image_encoder, full_head, dataset, args)['top1']
+        image_encoder = merged_encoder_tv.apply_to(pretrained_checkpoint, scaling_coef=scaling_coef)
+        classification_head = merged_head_tv.apply_to(head_init_path, scaling_coef=scaling_coef)
+        
+        _r = eval_with_head(image_encoder, classification_head, dataset, args)['top1']
         
         wandb.log({
             f"merging/TIES": _r * 100.0,
@@ -181,29 +195,34 @@ if __name__ == '__main__':
     wandb.init(
         project="magmax",
         group="merging-CIL",
-        # entity=args.wandb_entity_name,
         mode='online',
         name=name,
         config=args,
         tags=["merging", "CIL", f"{args.dataset}", f"{method}"],
     )
     
-    # preload task vectors
-    task_vectors = [
+    # 1. Encoderのタスクベクトルをロード
+    encoder_task_vectors = [
         TaskVector(pretrained_checkpoint, f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}{suffix}/finetuned_{_idx}.pt')
         for _idx in range(args.n_splits)
     ]
     
-    # Load and concatenate heads
-    full_head = load_and_concat_heads(args, suffix=suffix)
-    print(f"Successfully loaded and concatenated heads. Output shape: {full_head.weight.shape}")
+    # 2. Headのタスクベクトルをロード (リストとして取得)
+    head_init_path = f'checkpoints/{args.model}/{args.dataset}_full_head_init.pt'
+    head_task_vectors = load_head_task_vectors(args, head_init_path, suffix=suffix)
+    
+    print(f"Loaded {len(encoder_task_vectors)} encoder vectors and {len(head_task_vectors)} head vectors.")
 
-    # evaluate_individial_fts(task_vectors, args, task_agnostic=False)
-    # evaluate_individial_fts(task_vectors, args, task_agnostic=True)
-    # evaluate_merged_fts(task_vectors, args, merge_max_abs, 0.5, task_agnostic=True)
-    # evaluate_merged_fts(task_vectors, args, merge_max_abs, 0.5, task_agnostic=False)
-
-    search_evaluate_merging(task_vectors, full_head, args.dataset, args.n_splits, args.split_strategy)
+    # 3. マージと評価を実行
+    # ここでEncoderとHeadをペアにして、同じメソッドでマージ・評価します
+    search_evaluate_merging(
+        encoder_task_vectors, 
+        head_task_vectors, 
+        head_init_path, 
+        args.dataset, 
+        args.n_splits, 
+        args.split_strategy
+    )
 """import numpy as np
 import torch
 import wandb
