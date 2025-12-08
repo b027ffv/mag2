@@ -14,11 +14,12 @@ from src.eval import evaluate
 def finetune(args):
     
     train_dataset = args.dataset
+    # --- 変更: ディレクトリ名に timestamp を追加 ---
     ckpdir = os.path.join(args.save,
                           f"{train_dataset}-{args.n_splits}",
-                          f"ft-epochs-{args.epochs}-seed:{args.seed}"
+                          f"ft-epochs-{args.epochs}-seed:{args.seed}-{args.timestamp}" # 変更箇所
                           )
-
+    # ---------------------------------------------
     # 各分割タスクの学習
     for split_idx in range(args.n_splits):
         
@@ -157,7 +158,7 @@ def finetune(args):
 if __name__ == '__main__':
     args = parse_arguments()
 
-    args.lr = 1e-5
+    args.lr = 2e-4
     args.batch_size = 16 # 必要に応じて調整
     sequential_ft_dir = 'sequential_finetuning/' if args.sequential_finetuning else ''
     args.save = f'checkpoints/{args.model}/{sequential_ft_dir}{args.split_strategy}_incremental'

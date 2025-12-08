@@ -163,11 +163,24 @@ def parse_arguments():
         type=str,
         default="YOUR-WANDB-ACCOUNT"
     )
+    # --- 追加: Timestamp引数 ---
+    parser.add_argument(
+        "--timestamp",
+        type=str,
+        default=None,
+        help="Timestamp for the run ID (e.g. 20240520_153000)"
+    )
+    # -------------------------
     
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
     
     seed_everything(parsed_args.seed)
+
+    # --- 追加: Timestampの自動生成 ---
+    if parsed_args.timestamp is None:
+        parsed_args.timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    # ------------------------------
     
     assert parsed_args.lwf_lamb == 0.0 or parsed_args.ewc_lamb == 0.0, \
         "Lambda for LWF and EWC are mutually exclusive"

@@ -11,6 +11,11 @@ epochs=$3
 n_splits=$4
 seed=$5
 
+# --- 追加: Timestampの生成 ---
+TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
+echo "Run Timestamp: ${TIMESTAMP}"
+# ---------------------------
+
 # TRAIN
 out_dir=outs/${model}/sequential_finetuning/class_incremental/ft/${dataset}
 mkdir -p ${out_dir}
@@ -21,6 +26,7 @@ python finetune_splitted.py \
     --epochs ${epochs} \
     --n_splits ${n_splits} \
     --split_strategy class \
+    --timestamp ${TIMESTAMP} \
     --sequential-finetuning \
     --seed ${seed} \
         |& tee ${out_dir}/splits:${n_splits}-ep:${epochs}-seed:${seed}.out
@@ -36,6 +42,7 @@ python merge_splitted.py \
     --epochs ${epochs} \
     --n_splits ${n_splits} \
     --split_strategy class \
+    --timestamp ${TIMESTAMP} \
     --sequential-finetuning \
     --seed ${seed} \
         |& tee ${out_dir}/merge-${n_splits}-ep:${epochs}-seed:${seed}.out

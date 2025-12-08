@@ -28,7 +28,8 @@ def load_head_task_vectors(args, head_init_path, suffix=""):
     head_init = torch.load(head_init_path) # theta_init
     
     head_task_vectors = []
-    base_dir = f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}{suffix}'
+    # ここで timestamp をパスに含める
+    base_dir = f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}-{args.timestamp}{suffix}'
     print(f"Loading heads from {base_dir} and creating TaskVectors...")
 
     for split_idx in range(args.n_splits):
@@ -201,11 +202,12 @@ if __name__ == '__main__':
         tags=["merging", "CIL", f"{args.dataset}", f"{method}"],
     )
     
-    # 1. Encoderのタスクベクトルをロード
+    # --- 変更1: Encoderの読み込みパスに timestamp を追加 ---
     encoder_task_vectors = [
-        TaskVector(pretrained_checkpoint, f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}{suffix}/finetuned_{_idx}.pt')
+        TaskVector(pretrained_checkpoint, f'{args.save}/{args.dataset}-{args.n_splits}/ft-epochs-{args.epochs}-seed:{args.seed}-{args.timestamp}{suffix}/finetuned_{_idx}.pt')
         for _idx in range(args.n_splits)
     ]
+    # --------------------------------------------------
     
     # 2. Headのタスクベクトルをロード (リストとして取得)
     head_init_path = f'checkpoints/{args.model}/{args.dataset}_full_head_init.pt'
