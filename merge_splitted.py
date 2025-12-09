@@ -46,8 +46,8 @@ def load_head_task_vectors(args, head_init_path, suffix=""):
         # 差分計算 (Delta = theta_task_i - theta_init)
         # TaskVectorクラスは辞書形式のベクトルを受け取る
         vector_dict = {
-            'weight': task_head.weight - head_init.weight,
-            'bias': task_head.bias - head_init.bias
+            'weight': (task_head.weight - head_init.weight).detach(),
+            'bias': (task_head.bias - head_init.bias).detach()
         }
         # リストに追加
         head_task_vectors.append(TaskVector(vector=vector_dict))

@@ -56,12 +56,26 @@ def finetune(args):
         )
         
         # 修正版の関数を呼び出し（active_classesが付与されたdatasetが返る）
-        dataset, classification_head = get_dataset_and_classifier_for_split(
+        dataset, init_head = get_dataset_and_classifier_for_split(
             dataset, split_idx, image_encoder, args
         )
+
+        # --- 3. Classification Head の準備 (逐次学習対応) ---
+        classification_head = init_head
+        #headを逐次学習に変更
+        if args.sequential_finetuning and split_idx != 0:
+            prev_head_ckpt = os.path.join(ckpdir, f'head_{split_idx-1}.pt')
+            if os.path.exists(prev_head_ckpt):
+                print(f'Loading classification head from prev task {prev_head_ckpt=}')
+                try:
+                    classification_head = ClassificationHead.load(prev_head_ckpt)
+                except:
+                    classification_head = torch.load(prev_head_ckpt)
+            else:
+                print(f"Warning: Previous head checkpoint not found at {prev_head_ckpt}. Using init head.")
         
         model = ImageClassifier(image_encoder, classification_head)
-        model.freeze_head()
+        #model.freeze_head() #headを学習可能に
         model.freeze_lang()
 
         devices = list(range(torch.cuda.device_count()))
@@ -113,13 +127,13 @@ def finetune(args):
                 logits = model(inputs)
 
                 # 【変更点】 Logit Masking の適用
-                if use_mask:
+                """if use_mask:
                     # 全てを -inf で初期化
                     mask = torch.full_like(logits, float('-inf'))
                     # アクティブなクラスだけ 0 にする（元の値を保持）
                     mask[:, active_classes] = 0
                     # マスクを適用（非アクティブクラスは -inf になり、Softmaxで0になる）
-                    logits = logits + mask
+                    logits = logits + mask"""
 
                 loss = loss_fn(logits, labels)
                 loss.backward()
@@ -158,7 +172,7 @@ def finetune(args):
 if __name__ == '__main__':
     args = parse_arguments()
 
-    args.lr = 2e-4
+    args.lr = 5e-5
     args.batch_size = 16 # 必要に応じて調整
     sequential_ft_dir = 'sequential_finetuning/' if args.sequential_finetuning else ''
     args.save = f'checkpoints/{args.model}/{sequential_ft_dir}{args.split_strategy}_incremental'
