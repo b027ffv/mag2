@@ -62,7 +62,7 @@ def parse_arguments():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-5,
+        default=5e-5,
         help="Learning rate."
     )
     parser.add_argument(
@@ -171,6 +171,25 @@ def parse_arguments():
         help="Timestamp for the run ID (e.g. 20240520_153000)"
     )
     # -------------------------
+    # ONLINE / TASK-FREE SETTINGS (Online-LoRA params)
+    parser.add_argument(
+        "--loss-window-length",
+        type=int,
+        default=5,
+        help="Length of the sliding window for loss monitoring."
+    )
+    parser.add_argument(
+        "--loss-window-mean-threshold",
+        type=float,
+        default=6.0, # Online-LoRAのデフォルト値参照
+        help="Threshold for the mean loss to consider convergence."
+    )
+    parser.add_argument(
+        "--loss-window-variance-threshold",
+        type=float,
+        default=0.1, # Online-LoRAのデフォルト値参照
+        help="Threshold for the loss variance to consider convergence."
+    )
     
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
