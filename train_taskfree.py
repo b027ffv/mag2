@@ -114,7 +114,6 @@ def train_online(args):
         window_length=args.loss_window_length,
         mean_threshold=args.loss_window_mean_threshold,
         var_threshold=args.loss_window_variance_threshold,
-        patience=50 
     )
 
     # 5. オンライン学習ループ
@@ -143,12 +142,17 @@ def train_online(args):
         
         # 検知ロジック
         current_loss_val = loss.item()
-        is_plateau = detector.update(current_loss_val)
+        is_plateau, is_peak = detector.update(current_loss_val)
         
         if step % 10 == 0:
             print(f"Step [{step}/{total_steps}] Loss: {current_loss_val:.4f} "
                   f"Mean: {detector.last_loss_window_mean:.4f} "
                   f"Var: {detector.last_loss_window_variance:.4f}", end="\r")
+        
+        # --- 新しいピーク（タスク開始）検知時のログ ---
+        if is_peak:
+            print(f"\n[!] New Peak Detected at step {step} (Loss Increased)")
+            print(f"    Loss Mean: {detector.last_loss_window_mean:.4f}, Var: {detector.last_loss_window_variance:.4f}")
 
         # --- Plateau検知時の保存処理 ---
         if is_plateau:
@@ -184,7 +188,7 @@ def train_online(args):
 
 if __name__ == '__main__':
     args = parse_arguments()
-    args.batch_size = 64
+    args.batch_size = 16
     
     # 以下の引数が指定されていない場合のデフォルト動作を補正
     if not args.split_strategy:

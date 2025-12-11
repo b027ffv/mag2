@@ -28,10 +28,12 @@ class LossLandscapeDetector:
         """
         # Windowの更新
         self.loss_window.append(current_loss)
+        is_plateau = False
+        is_peak_start = False
         
         # Windowが埋まるまでは判定しない
         if len(self.loss_window) < self.window_length:
-            return False
+            return False , False
 
         # 平均と分散の計算
         loss_window_mean = np.mean(self.loss_window)
@@ -42,6 +44,7 @@ class LossLandscapeDetector:
         if not self.new_peak_detected:
             if loss_window_mean > self.last_loss_window_mean + np.sqrt(self.last_loss_window_variance):
                 self.new_peak_detected = True
+                is_peak_start = True # ピーク開始フラグを立てる
                 # print("DEBUG: New peak (loss increase) detected.")
 
         # 境界検知ロジック
@@ -57,6 +60,6 @@ class LossLandscapeDetector:
             self.last_loss_window_variance = loss_window_variance
             self.new_peak_detected = False # フラグをリセット
             
-            return True # 境界検知
+            is_plateau = True
 
-        return False
+        return is_plateau, is_peak_start
