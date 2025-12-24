@@ -1,6 +1,7 @@
 import os
 import time
 import torch
+import csv
 import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
 from copy import deepcopy
@@ -37,6 +38,8 @@ def train_online(args):
                           )
     os.makedirs(ckpdir, exist_ok=True)
     print(f"Checkpoints will be saved to: {ckpdir}")
+    # ログ保存用CSVパス
+    log_csv_path = os.path.join(ckpdir, "loss_history.csv")
     
     # ---------------------------------------------
 
@@ -108,12 +111,14 @@ def train_online(args):
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    #optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=0.0)
     
     # 4. 検知器の初期化
     detector = LossLandscapeDetector(
         window_length=args.loss_window_length,
-        mean_threshold=args.loss_window_mean_threshold,
-        var_threshold=args.loss_window_variance_threshold,
+        slope_threshold=5e-4,  # 傾き閾値
+        peak_factor=3.0,       # ピーク感度
+        min_task_duration=0   # 最低タスク長
     )
 
     # 5. オンライン学習ループ
@@ -122,6 +127,9 @@ def train_online(args):
     
     total_steps = len(stream_loader)
     detected_count = 0 # 検知回数カウンタ (split_idxの代わり)
+
+    #履歴保存用リスト
+    history = []
 
     for step, batch in enumerate(stream_loader):
         batch = maybe_dictionarize(batch)
@@ -143,21 +151,40 @@ def train_online(args):
         # 検知ロジック
         current_loss_val = loss.item()
         is_plateau, is_peak = detector.update(current_loss_val)
+
+        # 現在の状態を取得
+        current_slope = detector.current_slope
+        current_min_mean = detector.current_task_min_mean
+        
+        # イベント情報を記録
+        event_type = "None"
+        if is_plateau: event_type = "Plateau"
+        if is_peak: event_type = "Peak"
+        
+        # 履歴に追加
+        history.append({
+            "step": step,
+            "loss": current_loss_val,
+            "slope": current_slope,
+            "min_mean": current_min_mean if current_min_mean != float('inf') else np.nan,
+            "in_peak_region": int(detector.in_peak_region),
+            "event": event_type
+        })
         
         if step % 10 == 0:
             print(f"Step [{step}/{total_steps}] Loss: {current_loss_val:.4f} "
-                  f"Mean: {detector.last_loss_window_mean:.4f} "
-                  f"Var: {detector.last_loss_window_variance:.4f}", end="\r")
+                  f"Slope: {current_slope:.6f} "
+                  f"MinMean: {current_min_mean:.4f}", end="\r")
         
         # --- 新しいピーク（タスク開始）検知時のログ ---
         if is_peak:
             print(f"\n[!] New Peak Detected at step {step} (Loss Increased)")
-            print(f"    Loss Mean: {detector.last_loss_window_mean:.4f}, Var: {detector.last_loss_window_variance:.4f}")
+            #print(f"    Loss Mean: {detector.last_loss_window_mean:.4f}, Var: {detector.last_loss_window_variance:.4f}")
 
         # --- Plateau検知時の保存処理 ---
         if is_plateau:
             print(f"\n[!] Plateau Detected at step {step} (Count: {detected_count})")
-            print(f"    Loss Mean: {detector.last_loss_window_mean:.4f}, Var: {detector.last_loss_window_variance:.4f}")
+            #print(f"    Loss Mean: {detector.last_loss_window_mean:.4f}, Var: {detector.last_loss_window_variance:.4f}")
             
             # MagMax互換のファイル名で保存
             # finetuned_{idx}.pt (エンコーダー)
@@ -185,6 +212,14 @@ def train_online(args):
                 model = model.to(device)
 
     print("\nOnline Training Finished.")
+    # 5. CSVへの保存
+    print(f"Saving loss history to {log_csv_path} ...")
+    keys = history[0].keys()
+    with open(log_csv_path, 'w', newline='') as output_file:
+        dict_writer = csv.DictWriter(output_file, fieldnames=keys)
+        dict_writer.writeheader()
+        dict_writer.writerows(history)
+    print("Done.")
 
 if __name__ == '__main__':
     args = parse_arguments()
